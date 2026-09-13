@@ -266,6 +266,15 @@
     return byLength.slice(0, limit);
   }
 
+  // Backup net: strip common AI self-disclosure phrases if the model
+  // ignores the system prompt's instruction not to use them.
+  function stripAiDisclaimers(text) {
+    return text
+      .replace(/^(as an ai|as a language model|i'm an ai|i am an ai)[^.!?]*[.!?]\s*/gi, "")
+      .replace(/\(?(note|disclaimer):[^)]*\)?\s*/gi, "")
+      .trim() || text; // never return an empty string
+  }
+
   function addMessage(text, sender) {
     const div = document.createElement("div");
     div.className = `msg ${sender}`;
@@ -350,15 +359,21 @@
         .map((m) => `${m.sender}: ${m.text}`)
         .join("\n");
 
+      const noBreakingCharacter =
+        "Everyone in this chat already knows this is a simulation for fun — never say you are an AI, " +
+        "a language model, an assistant, or a chatbot, and never add disclaimers, caveats, or " +
+        "reminders that this isn't real. Just reply in character, like a normal chat message.";
+
       const systemPrompt = selectedPerson
         ? `You are ${selectedPerson}, a real person, replying in a private group chat. Below are ` +
           `real messages ${selectedPerson} actually sent. Study their exact word choices, slang, ` +
           `punctuation, capitalization, and typical message length, and reply exactly the way they ` +
           `would — don't write a polished or generic sentence. Reply only as ${selectedPerson}, one ` +
-          `short message, nothing else.\n\n${selectedPerson}'s actual messages:\n${context}`
+          `short message, nothing else. ${noBreakingCharacter}\n\n` +
+          `${selectedPerson}'s actual messages:\n${context}`
         : "You are role-playing as the participants of a private group chat, based on real message " +
           "excerpts below. Match their tone, humor, and speech patterns. Keep replies short, like a " +
-          "real chat message, not an essay.\n\nExcerpts:\n" + context;
+          `real chat message, not an essay. ${noBreakingCharacter}\n\nExcerpts:\n` + context;
 
       const reply = await Promise.race([
         engine.chat.completions.create({
@@ -373,7 +388,7 @@
       ]);
 
       hideTyping();
-      addMessage(reply.choices[0].message.content, "bot");
+      addMessage(stripAiDisclaimers(reply.choices[0].message.content), "bot");
     } catch (err) {
       console.error("Generation failed:", err);
       hideTyping();
