@@ -193,7 +193,7 @@
   // Pick a small-ish model so it loads reasonably fast in-browser.
   // Check the WebLLM model list for current options/names before deploying:
   // https://github.com/mlc-ai/web-llm
-  const MODEL_ID = "Llama-3.2-1B-Instruct-q4f32_1-MLC";
+  const MODEL_ID = "Llama-3.2-3B-Instruct-q4f32_1-MLC";
 
   let chatLog = null;
   let engine = null;
@@ -240,7 +240,7 @@
   // conversation history, leaving room for ~90 short chat messages as
   // context plus the reply itself. Drop this if replies feel slow, or the
   // model starts ignoring the start of the context.
-  const CONTEXT_MESSAGE_LIMIT = 90;
+  const CONTEXT_MESSAGE_LIMIT = 40;
 
   // Very simple retrieval: score each message by keyword overlap with the
   // question, return the most relevant ones as context. Good enough for a
@@ -251,16 +251,19 @@
     const queryWords = query.toLowerCase().split(/\W+/).filter(Boolean);
     const scored = pool.map((m) => {
       const text = (m.text || "").toLowerCase();
-      const score = queryWords.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
-      return { m, score };
+      const keywordScore = queryWords.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
+      // Small bonus for longer messages — one-word replies like "lol" carry
+      // almost no style signal, so nudge more characterful ones to the top.
+      const lengthBonus = Math.min(text.length / 40, 2);
+      return { m, score: keywordScore + lengthBonus * (keywordScore > 0 ? 1 : 0.01) };
     });
     scored.sort((a, b) => b.score - a.score);
-    const top = scored.filter((s) => s.score > 0).slice(0, limit).map((s) => s.m);
-    // Fall back to a random recent sample if nothing matched keywords
-    if (top.length === 0) {
-      return pool.slice(-limit);
-    }
-    return top;
+    const matched = scored.filter((s) => s.score > 0.01).slice(0, limit).map((s) => s.m);
+    if (matched.length >= Math.min(10, limit)) return matched;
+    // Not enough keyword matches — fall back to their most characterful
+    // recent messages instead of just "last N chronologically."
+    const byLength = [...pool].sort((a, b) => (b.text || "").length - (a.text || "").length);
+    return byLength.slice(0, limit);
   }
 
   function addMessage(text, sender) {
@@ -348,11 +351,11 @@
         .join("\n");
 
       const systemPrompt = selectedPerson
-        ? `You are role-playing as ${selectedPerson}, a real person from a private group chat, ` +
-          `based on their actual message excerpts below. Reply only in their voice — do not speak ` +
-          `as anyone else or invent other people's dialogue. Match their tone, humor, and speech ` +
-          `patterns. Keep it short, like a real chat message, not an essay.\n\n` +
-          `${selectedPerson}'s past messages:\n${context}`
+        ? `You are ${selectedPerson}, a real person, replying in a private group chat. Below are ` +
+          `real messages ${selectedPerson} actually sent. Study their exact word choices, slang, ` +
+          `punctuation, capitalization, and typical message length, and reply exactly the way they ` +
+          `would — don't write a polished or generic sentence. Reply only as ${selectedPerson}, one ` +
+          `short message, nothing else.\n\n${selectedPerson}'s actual messages:\n${context}`
         : "You are role-playing as the participants of a private group chat, based on real message " +
           "excerpts below. Match their tone, humor, and speech patterns. Keep replies short, like a " +
           "real chat message, not an essay.\n\nExcerpts:\n" + context;
