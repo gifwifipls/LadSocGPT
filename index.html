@@ -375,25 +375,44 @@
           "excerpts below. Match their tone, humor, and speech patterns. Keep replies short, like a " +
           `real chat message, not an essay. ${noBreakingCharacter}\n\nExcerpts:\n` + context;
 
-      const reply = await Promise.race([
-        engine.chat.completions.create({
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: text },
-          ],
-        }),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("timeout")), 120000)
-        ),
-      ]);
+      let botBubble = null;
+      let fullText = "";
+      const STALL_LIMIT_MS = 45000; // no new token for 45s = treat as stuck
 
-      hideTyping();
-      addMessage(stripAiDisclaimers(reply.choices[0].message.content), "bot");
+      const stream = await engine.chat.completions.create({
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: text },
+        ],
+        stream: true,
+      });
+
+      const iterator = stream[Symbol.asyncIterator]();
+      while (true) {
+        const next = await Promise.race([
+          iterator.next(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("stalled")), STALL_LIMIT_MS)),
+        ]);
+        if (next.done) break;
+
+        const delta = next.value.choices[0]?.delta?.content || "";
+        if (delta) {
+          if (!botBubble) {
+            hideTyping();
+            botBubble = addMessage("", "bot");
+          }
+          fullText += delta;
+          botBubble.textContent = stripAiDisclaimers(fullText);
+          $("messages").scrollTop = $("messages").scrollHeight;
+        }
+      }
+
+      if (!fullText.trim()) throw new Error("empty");
     } catch (err) {
-      console.error("Generation failed:", err);
       hideTyping();
-      const msg = err.message === "timeout"
-        ? "That's taking too long (2+ min) — your browser may not have WebGPU support, or your GPU is struggling with this model. Check the console (F12) for details."
+      console.error("Generation failed:", err);
+      const msg = err.message === "stalled"
+        ? "Generation stalled partway through — your GPU may be struggling with this model. Try a smaller model."
         : "Something went wrong generating that reply — try again.";
       addMessage(msg, "bot");
     } finally {
