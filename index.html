@@ -193,10 +193,11 @@
   // Pick a small-ish model so it loads reasonably fast in-browser.
   // Check the WebLLM model list for current options/names before deploying:
   // https://github.com/mlc-ai/web-llm
-  const MODEL_ID = "Qwen2.5-1.5B-Instruct-q4f16_1-MLC";
+  const MODEL_ID = "Llama-3.2-3B-Instruct-q4f16_1-MLC";
 
   let chatLog = null;
   let engine = null;
+  let hasGeneratedOnce = false;
 
   const $ = (id) => document.getElementById(id);
 
@@ -353,6 +354,12 @@
     $("input").disabled = true;
     $("composer").querySelector("button").disabled = true;
     showTyping();
+    let warmupNote = null;
+    if (!hasGeneratedOnce) {
+      warmupNote = addMessage("First reply includes a one-time GPU warm-up and can take a few minutes. Later replies will be much faster.", "bot");
+      warmupNote.style.fontSize = "0.85rem";
+      warmupNote.style.color = "var(--ink-soft)";
+    }
 
     try {
       const context = findRelevantMessages(text, chatLog, selectedPerson)
@@ -369,23 +376,30 @@
           `real messages ${selectedPerson} actually sent. Study their exact word choices, slang, ` +
           `punctuation, capitalization, and typical message length, and reply exactly the way they ` +
           `would — don't write a polished or generic sentence. Reply only as ${selectedPerson}, one ` +
-          `message, nothing else. ${noBreakingCharacter}\n\n` +
+          `short message, nothing else. ${noBreakingCharacter}\n\n` +
           `${selectedPerson}'s actual messages:\n${context}`
         : "You are role-playing as the participants of a private group chat, based on real message " +
-          "excerpts below. Match their tone, humor, and speech patterns. Keep replies like a " +
+          "excerpts below. Match their tone, humor, and speech patterns. Keep replies short, like a " +
           `real chat message, not an essay. ${noBreakingCharacter}\n\nExcerpts:\n` + context;
 
       let botBubble = null;
       let fullText = "";
-      const STALL_LIMIT_MS = 45000; // no new token for 45s = treat as stuck
+      // The first generation after load includes one-time GPU shader compilation,
+      // which can take minutes on weaker GPUs. Later replies are fast.
+      const STALL_LIMIT_MS = hasGeneratedOnce ? 45000 : 300000;
 
-      const stream = await engine.chat.completions.create({
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: text },
-        ],
-        stream: true,
-      });
+      const stream = await Promise.race([
+        engine.chat.completions.create({
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: text },
+          ],
+          stream: true,
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("stalled-prefill")), STALL_LIMIT_MS)
+        ),
+      ]);
 
       const iterator = stream[Symbol.asyncIterator]();
       while (true) {
@@ -408,14 +422,24 @@
       }
 
       if (!fullText.trim()) throw new Error("empty");
+      hasGeneratedOnce = true;
     } catch (err) {
       hideTyping();
       console.error("Generation failed:", err);
-      const msg = err.message === "stalled"
-        ? "Generation stalled partway through — your GPU may be struggling with this model. Try a smaller model."
+      const msg = err.message === "stalled" || err.message === "stalled-prefill"
+        ? "Generation stalled — your GPU may be struggling with this much context on this model. Try a smaller model or fewer context messages."
         : "Something went wrong generating that reply — try again.";
       addMessage(msg, "bot");
+
+      if (err.message === "stalled" || err.message === "stalled-prefill") {
+        try {
+          await engine.interruptGenerate();
+        } catch (_) {
+          // best-effort — some engine states can't be interrupted cleanly
+        }
+      }
     } finally {
+      if (warmupNote) warmupNote.remove();
       $("input").disabled = false;
       $("composer").querySelector("button").disabled = false;
       $("input").focus();
