@@ -27,10 +27,11 @@
   main {
     width: 100%;
     max-width: 640px;
-    padding: 24px 20px 40px;
+    padding: 24px 20px 20px;
     display: flex;
     flex-direction: column;
-    min-height: 100vh;
+    height: 100vh;
+    height: 100dvh; /* mobile browsers: exclude the address bar */
   }
   h1 {
     font-family: Georgia, "Iowan Old Style", serif;
@@ -80,9 +81,10 @@
   #error { color: #B03A2E; font-size: 0.9rem; }
 
   /* --- Chat --- */
-  #chat-screen { display: none; flex-direction: column; flex: 1; }
+  #chat-screen { display: none; flex-direction: column; flex: 1; min-height: 0; }
   #messages {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -124,8 +126,20 @@
     30% { transform: translateY(-4px); opacity: 1; }
   }
 
+  body.chatting .subtitle { display: none; }
+  body.chatting h1 { font-size: 1.15rem; margin-bottom: 12px; }
+  .msg.note {
+    align-self: center;
+    max-width: 100%;
+    background: none;
+    border: none;
+    color: var(--ink-soft);
+    font-size: 0.8rem;
+    padding: 2px 8px;
+  }
   .msg .who { font-size: 0.75rem; color: var(--ink-soft); margin-bottom: 2px; }
   #persona-bar {
+    flex-shrink: 0;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -142,6 +156,7 @@
   }
   #input:disabled, #composer button:disabled { opacity: 0.6; }
   form#composer {
+    flex-shrink: 0;
     display: flex;
     gap: 8px;
     border-top: 1px solid var(--line);
@@ -431,6 +446,7 @@
     $("status").textContent = "";
     $("lock").style.display = "none";
     $("chat-screen").style.display = "flex";
+    document.body.classList.add("chatting");
     addMessage("Loaded. Ask away.", "bot");
   }
 
@@ -445,6 +461,7 @@
     $("input").value = "";
     $("input").disabled = true;
     $("composer").querySelector("button").disabled = true;
+    $("persona-select").disabled = true;
     showTyping();
     let warmupNote = null;
     if (!hasGeneratedOnce) {
@@ -551,6 +568,7 @@
       }
     } finally {
       if (warmupNote) warmupNote.remove();
+      $("persona-select").disabled = false;
       if (!gpuLost) {
         $("input").disabled = false;
         $("composer").querySelector("button").disabled = false;
@@ -561,6 +579,12 @@
 
   $("unlock-btn").addEventListener("click", handleUnlock);
   $("composer").addEventListener("submit", handleSend);
+  $("persona-select").addEventListener("change", () => {
+    liveHistory = []; // forget the previous persona's conversation
+    const who = $("persona-select").value || "Anyone (whole group)";
+    addMessage(`Switched to ${who}. Conversation context cleared.`, "note");
+    $("input").focus();
+  });
 </script>
 </body>
 </html>
