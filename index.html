@@ -124,6 +124,7 @@
     30% { transform: translateY(-4px); opacity: 1; }
   }
 
+  .msg .who { font-size: 0.75rem; color: var(--ink-soft); margin-bottom: 2px; }
   #persona-bar {
     display: flex;
     align-items: center;
@@ -199,6 +200,7 @@
   let engine = null;
   let hasGeneratedOnce = false;
   let gpuLost = false;
+  let liveHistory = []; // recent lines of the live conversation, for follow-ups
 
   const $ = (id) => document.getElementById(id);
 
@@ -237,59 +239,123 @@
     return JSON.parse(new TextDecoder().decode(plainBuf));
   }
 
-  // Keep the prompt SMALL. On weaker GPUs, Windows kills the GPU if a single
-  // step takes ~2s, and long prompts make the first step longer. So we cap
-  // the number of messages, the length of each, and the total size.
-  const CONTEXT_MESSAGE_LIMIT = 20;
-  const MAX_CHARS_PER_MESSAGE = 160;
-  const MAX_CONTEXT_CHARS = 1800; // roughly 450 tokens
+  // ---- Exchange-based retrieval -------------------------------------------
+  // Instead of showing the model random lines, we find past moments where
+  // someone said something similar to the user's message, and show what the
+  // chosen person actually REPLIED. The prompt ends with "Name:" so the model
+  // just continues the pattern. Keep everything small: big prompts hang the
+  // GPU on Windows (DEVICE_HUNG).
+  const EXCHANGE_COUNT = 6;            // example exchanges shown to the model
+  const MAX_LINE_CHARS = 140;          // each line truncated to this
+  const MAX_REPLY_CHARS = 140;         // only use short/medium replies as examples
+  const MAX_EXAMPLES_CHARS = 1800;     // hard cap on all example text (~450 tokens)
+  const REPLY_WINDOW_MS = 10 * 60 * 1000; // a "reply" must follow within 10 min
+  const HISTORY_LINES = 4;             // recent live-chat lines to include
 
-  // Very simple retrieval: score each message by keyword overlap with the
-  // question, return the most relevant ones as context. Good enough for a
-  // group chat's worth of data without needing a vector database.
-  // If senderFilter is set, only that person's own messages are considered.
-  function findRelevantMessages(query, messages, senderFilter, limit = CONTEXT_MESSAGE_LIMIT) {
-    const pool = senderFilter ? messages.filter((m) => m.sender === senderFilter) : messages;
-    const queryWords = query.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
-    const scored = pool.map((m) => {
-      const text = (m.text || "").toLowerCase();
-      const keywordScore = queryWords.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
-      // Small bonus for longer messages — one-word replies like "lol" carry
-      // almost no style signal, so nudge more characterful ones to the top.
-      const lengthBonus = Math.min(text.length / 40, 2);
-      return { m, score: keywordScore + lengthBonus * (keywordScore > 0 ? 1 : 0.01) };
-    });
-    scored.sort((a, b) => b.score - a.score);
-    const matched = scored.filter((s) => s.score > 0.01).slice(0, limit).map((s) => s.m);
-    if (matched.length >= Math.min(10, limit)) return matched;
-    // Not enough keyword matches (e.g. "hi"): use a random sample of
-    // normal-length messages so we get variety without giant rants.
-    let candidates = pool.filter((m) => {
-      const n = (m.text || "").length;
-      return n >= 15 && n <= MAX_CHARS_PER_MESSAGE;
-    });
-    if (candidates.length < limit) candidates = pool;
-    const shuffled = [...candidates];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    return shuffled.slice(0, limit);
+  const STOPWORDS = new Set(("the and you for are but not was this that with have just like what when who " +
+    "how why can get got its it's i'm dont don't your they them then there their about from out all one " +
+    "has had were been will would could should did does yes yeah okay lol haha").split(" "));
+
+  let exchanges = [];          // [{ context: [msg, msg], reply: msg, tokens: Set }]
+  let docFreq = new Map();     // word -> number of exchanges whose context has it
+
+  function tokenize(text) {
+    return (String(text || "").toLowerCase().match(/[\p{L}\p{N}']+/gu) || [])
+      .filter((w) => w.length > 2 && !STOPWORDS.has(w));
   }
 
-  // Truncate long messages and stop adding once the total budget is hit.
-  function buildContext(msgs) {
-    const lines = [];
-    let total = 0;
-    for (const m of msgs) {
-      let t = (m.text || "").replace(/\s+/g, " ").trim();
-      if (t.length > MAX_CHARS_PER_MESSAGE) t = t.slice(0, MAX_CHARS_PER_MESSAGE) + "…";
-      const line = `${m.sender}: ${t}`;
-      if (total + line.length > MAX_CONTEXT_CHARS) break;
-      lines.push(line);
-      total += line.length + 1;
+  function clip(text, n) {
+    const t = String(text || "").replace(/\s+/g, " ").trim();
+    return t.length > n ? t.slice(0, n) + "…" : t;
+  }
+
+  // Run once after decryption. Pairs each message with what it was replying to.
+  function buildExchangeIndex(messages) {
+    exchanges = [];
+    docFreq = new Map();
+    for (let i = 1; i < messages.length; i++) {
+      const reply = messages[i];
+      const prev = messages[i - 1];
+      const replyText = String(reply.text || "").trim();
+      if (replyText.length < 3 || replyText.length > MAX_REPLY_CHARS) continue;
+      if (!prev || prev.sender === reply.sender) continue;        // must answer someone else
+      if (reply.timestamp - prev.timestamp > REPLY_WINDOW_MS) continue; // too long a gap
+      const context = [prev];
+      const prev2 = messages[i - 2];
+      if (prev2 && prev.timestamp - prev2.timestamp <= REPLY_WINDOW_MS) context.unshift(prev2);
+      const tokens = new Set(tokenize(context.map((c) => c.text).join(" ")));
+      for (const t of tokens) docFreq.set(t, (docFreq.get(t) || 0) + 1);
+      exchanges.push({ context, reply, tokens });
     }
-    return lines.join("\n");
+  }
+
+  // Returns the best-matching exchanges (best match LAST, since models weigh
+  // the end of the prompt most) plus a suggested replier for "Anyone" mode.
+  function pickExchanges(query, personFilter) {
+    const pool = personFilter ? exchanges.filter((e) => e.reply.sender === personFilter) : exchanges;
+    const qTokens = [...new Set(tokenize(query))];
+    const total = exchanges.length || 1;
+
+    const scored = [];
+    if (qTokens.length) {
+      for (const e of pool) {
+        let score = 0;
+        // rare words (e.g. "airbnb") count for more than common ones
+        for (const t of qTokens) if (e.tokens.has(t)) score += Math.log(1 + total / (docFreq.get(t) || 1));
+        if (score > 0) scored.push({ e, score });
+      }
+      scored.sort((a, b) => b.score - a.score);
+    }
+    const matched = scored.slice(0, EXCHANGE_COUNT).map((x) => x.e); // best first
+
+    // Pad with random exchanges so there's always some style to copy.
+    const padding = [];
+    if (matched.length < EXCHANGE_COUNT) {
+      const used = new Set(matched);
+      const rest = pool.filter((e) => !used.has(e));
+      const need = Math.min(EXCHANGE_COUNT - matched.length, rest.length);
+      for (let i = 0; i < need; i++) {
+        const j = i + Math.floor(Math.random() * (rest.length - i));
+        [rest[i], rest[j]] = [rest[j], rest[i]];
+        padding.push(rest[i]);
+      }
+    }
+
+    // Who should answer in "Anyone" mode? Whoever most often replied in the matches.
+    let suggested = null;
+    const pickFrom = matched.length ? matched : padding;
+    if (pickFrom.length) {
+      const counts = new Map();
+      for (const e of pickFrom) counts.set(e.reply.sender, (counts.get(e.reply.sender) || 0) + 1);
+      let bestN = 0;
+      for (const e of pickFrom) {
+        const n = counts.get(e.reply.sender);
+        if (n > bestN) { bestN = n; suggested = e.reply.sender; }
+      }
+    }
+
+    return { examples: [...padding, ...matched.reverse()], suggested };
+  }
+
+  function formatExamples(examples) {
+    const blocks = examples.map((e) =>
+      [...e.context, e.reply].map((m) => `${m.sender}: ${clip(m.text, MAX_LINE_CHARS)}`).join("\n")
+    );
+    // Over budget? Drop the least relevant (first) exchanges until it fits.
+    while (blocks.length > 1 && blocks.join("\n\n").length > MAX_EXAMPLES_CHARS) blocks.shift();
+    return blocks.join("\n\n");
+  }
+
+  function escapeRegExp(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  // Model sometimes writes "Sam: ..." itself, or keeps going on a new line.
+  function cleanReply(raw, name) {
+    let t = String(raw).replace(/^\s+/, "");
+    t = t.replace(new RegExp("^" + escapeRegExp(name) + "\\s*:\\s*", "i"), "");
+    t = t.split("\n")[0];
+    return stripAiDisclaimers(t).trim();
   }
 
   // Backup net: strip common AI self-disclosure phrases if the model
@@ -346,6 +412,7 @@
     try {
       chatLog = await decryptChatLog(passphrase);
       populatePersonaSelect(chatLog);
+      buildExchangeIndex(chatLog);
     } catch (e) {
       $("error").textContent = "Wrong passphrase, or the data didn't decrypt. Try again.";
       $("unlock-btn").disabled = false;
@@ -387,27 +454,28 @@
     }
 
     try {
-      const context = buildContext(findRelevantMessages(text, chatLog, selectedPerson));
+      const { examples, suggested } = pickExchanges(text, selectedPerson);
+      const replier = selectedPerson || suggested || "a friend";
+      const examplesText = formatExamples(examples);
+      const recent = liveHistory.slice(-HISTORY_LINES).join("\n");
 
-      const noBreakingCharacter =
-        "Everyone in this chat already knows this is a simulation for fun — never say you are an AI, " +
-        "a language model, an assistant, or a chatbot, and never add disclaimers, caveats, or " +
-        "reminders that this isn't real. Just reply in character, like a normal chat message.";
+      const systemPrompt =
+        `You write the next message in a private group chat of friends, exactly as ${replier} would: ` +
+        `same slang, tone, punctuation and length. Reply with one short chat message only, no ` +
+        `explanation. Everyone knows this is a fun simulation, so never mention being an AI.`;
 
-      const systemPrompt = selectedPerson
-        ? `You are ${selectedPerson}, a real person, replying in a private group chat. Below are ` +
-          `real messages ${selectedPerson} actually sent. Study their exact word choices, slang, ` +
-          `punctuation, capitalization, and typical message length, and reply exactly the way they ` +
-          `would — don't write a polished or generic sentence. Reply only as ${selectedPerson}, one ` +
-          `short message, nothing else. ${noBreakingCharacter}\n\n` +
-          `${selectedPerson}'s actual messages:\n${context}`
-        : "You are role-playing as the participants of a private group chat, based on real message " +
-          "excerpts below. Match their tone, humor, and speech patterns. Keep replies short, like a " +
-          `real chat message, not an essay. ${noBreakingCharacter}\n\nExcerpts:\n` + context;
+      const userPrompt =
+        (examplesText ? `Real past exchanges from this chat:\n\n${examplesText}\n\n` : "") +
+        `Now the chat continues:\n` +
+        (recent ? recent + "\n" : "") +
+        `You: ${clip(text, 300)}\n${replier}:`;
 
-      console.log(`Prompt size: ${systemPrompt.length} chars`);
+      console.log(`Prompt size: ${systemPrompt.length + userPrompt.length} chars, ${examples.length} example exchanges`);
+
       let botBubble = null;
+      let bodyEl = null;
       let fullText = "";
+      let cleaned = "";
       // The first generation after load includes one-time GPU shader compilation,
       // which can take minutes on weaker GPUs. Later replies are fast.
       const STALL_LIMIT_MS = hasGeneratedOnce ? 45000 : 300000;
@@ -416,10 +484,13 @@
         engine.chat.completions.create({
           messages: [
             { role: "system", content: systemPrompt },
-            { role: "user", content: text },
+            { role: "user", content: userPrompt },
           ],
           stream: true,
-          max_tokens: 100,
+          max_tokens: 80,
+          temperature: 0.9,
+          top_p: 0.95,
+          stop: ["\n"], // one chat message, then stop
         }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error("stalled-prefill")), STALL_LIMIT_MS)
@@ -435,18 +506,26 @@
         if (next.done) break;
 
         const delta = next.value.choices[0]?.delta?.content || "";
-        if (delta) {
-          if (!botBubble) {
-            hideTyping();
-            botBubble = addMessage("", "bot");
-          }
-          fullText += delta;
-          botBubble.textContent = stripAiDisclaimers(fullText);
-          $("messages").scrollTop = $("messages").scrollHeight;
+        if (!delta) continue;
+        fullText += delta;
+        cleaned = cleanReply(fullText, replier);
+        if (!cleaned) continue; // nothing visible yet (e.g. only "Sam:" so far)
+
+        if (!botBubble) {
+          hideTyping();
+          botBubble = addMessage("", "bot");
+          const who = document.createElement("div");
+          who.className = "who";
+          who.textContent = replier;
+          bodyEl = document.createElement("div");
+          botBubble.append(who, bodyEl);
         }
+        bodyEl.textContent = cleaned;
+        $("messages").scrollTop = $("messages").scrollHeight;
       }
 
-      if (!fullText.trim()) throw new Error("empty");
+      if (!cleaned.trim()) throw new Error("empty");
+      liveHistory.push(`You: ${clip(text, 300)}`, `${replier}: ${clip(cleaned, 200)}`);
       hasGeneratedOnce = true;
     } catch (err) {
       hideTyping();
