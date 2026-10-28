@@ -198,6 +198,7 @@
   let chatLog = null;
   let engine = null;
   let hasGeneratedOnce = false;
+  let gpuLost = false;
 
   const $ = (id) => document.getElementById(id);
 
@@ -236,12 +237,12 @@
     return JSON.parse(new TextDecoder().decode(plainBuf));
   }
 
-  // The model's context window (Llama-3.2-3B here runs at ~4k tokens) sets
-  // the ceiling. Rough budget: ~700 tokens for the system instructions +
-  // conversation history, leaving room for ~90 short chat messages as
-  // context plus the reply itself. Drop this if replies feel slow, or the
-  // model starts ignoring the start of the context.
-  const CONTEXT_MESSAGE_LIMIT = 40;
+  // Keep the prompt SMALL. On weaker GPUs, Windows kills the GPU if a single
+  // step takes ~2s, and long prompts make the first step longer. So we cap
+  // the number of messages, the length of each, and the total size.
+  const CONTEXT_MESSAGE_LIMIT = 20;
+  const MAX_CHARS_PER_MESSAGE = 160;
+  const MAX_CONTEXT_CHARS = 1800; // roughly 450 tokens
 
   // Very simple retrieval: score each message by keyword overlap with the
   // question, return the most relevant ones as context. Good enough for a
@@ -249,7 +250,7 @@
   // If senderFilter is set, only that person's own messages are considered.
   function findRelevantMessages(query, messages, senderFilter, limit = CONTEXT_MESSAGE_LIMIT) {
     const pool = senderFilter ? messages.filter((m) => m.sender === senderFilter) : messages;
-    const queryWords = query.toLowerCase().split(/\W+/).filter(Boolean);
+    const queryWords = query.toLowerCase().split(/\W+/).filter((w) => w.length > 2);
     const scored = pool.map((m) => {
       const text = (m.text || "").toLowerCase();
       const keywordScore = queryWords.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0);
@@ -261,10 +262,34 @@
     scored.sort((a, b) => b.score - a.score);
     const matched = scored.filter((s) => s.score > 0.01).slice(0, limit).map((s) => s.m);
     if (matched.length >= Math.min(10, limit)) return matched;
-    // Not enough keyword matches — fall back to their most characterful
-    // recent messages instead of just "last N chronologically."
-    const byLength = [...pool].sort((a, b) => (b.text || "").length - (a.text || "").length);
-    return byLength.slice(0, limit);
+    // Not enough keyword matches (e.g. "hi"): use a random sample of
+    // normal-length messages so we get variety without giant rants.
+    let candidates = pool.filter((m) => {
+      const n = (m.text || "").length;
+      return n >= 15 && n <= MAX_CHARS_PER_MESSAGE;
+    });
+    if (candidates.length < limit) candidates = pool;
+    const shuffled = [...candidates];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled.slice(0, limit);
+  }
+
+  // Truncate long messages and stop adding once the total budget is hit.
+  function buildContext(msgs) {
+    const lines = [];
+    let total = 0;
+    for (const m of msgs) {
+      let t = (m.text || "").replace(/\s+/g, " ").trim();
+      if (t.length > MAX_CHARS_PER_MESSAGE) t = t.slice(0, MAX_CHARS_PER_MESSAGE) + "…";
+      const line = `${m.sender}: ${t}`;
+      if (total + line.length > MAX_CONTEXT_CHARS) break;
+      lines.push(line);
+      total += line.length + 1;
+    }
+    return lines.join("\n");
   }
 
   // Backup net: strip common AI self-disclosure phrases if the model
@@ -362,9 +387,7 @@
     }
 
     try {
-      const context = findRelevantMessages(text, chatLog, selectedPerson)
-        .map((m) => `${m.sender}: ${m.text}`)
-        .join("\n");
+      const context = buildContext(findRelevantMessages(text, chatLog, selectedPerson));
 
       const noBreakingCharacter =
         "Everyone in this chat already knows this is a simulation for fun — never say you are an AI, " +
@@ -382,6 +405,7 @@
           "excerpts below. Match their tone, humor, and speech patterns. Keep replies short, like a " +
           `real chat message, not an essay. ${noBreakingCharacter}\n\nExcerpts:\n` + context;
 
+      console.log(`Prompt size: ${systemPrompt.length} chars`);
       let botBubble = null;
       let fullText = "";
       // The first generation after load includes one-time GPU shader compilation,
@@ -395,6 +419,7 @@
             { role: "user", content: text },
           ],
           stream: true,
+          max_tokens: 100,
         }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error("stalled-prefill")), STALL_LIMIT_MS)
@@ -426,7 +451,14 @@
     } catch (err) {
       hideTyping();
       console.error("Generation failed:", err);
-      const msg = err.message === "stalled" || err.message === "stalled-prefill"
+      const disposed = String(err.message).includes("disposed");
+      if (disposed) {
+        gpuLost = true;
+        $("input").placeholder = "GPU connection lost, refresh the page to continue";
+      }
+      const msg = disposed
+        ? "The GPU connection was lost (Windows reset the graphics driver). Refresh the page and unlock again."
+        : err.message === "stalled" || err.message === "stalled-prefill"
         ? "Generation stalled — your GPU may be struggling with this much context on this model. Try a smaller model or fewer context messages."
         : "Something went wrong generating that reply — try again.";
       addMessage(msg, "bot");
@@ -440,9 +472,11 @@
       }
     } finally {
       if (warmupNote) warmupNote.remove();
-      $("input").disabled = false;
-      $("composer").querySelector("button").disabled = false;
-      $("input").focus();
+      if (!gpuLost) {
+        $("input").disabled = false;
+        $("composer").querySelector("button").disabled = false;
+        $("input").focus();
+      }
     }
   }
 
