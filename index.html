@@ -213,6 +213,7 @@
   const MODEL_ID = "Qwen2.5-1.5B-Instruct-q4f16_1-MLC";
 
   let chatLog = null;
+  let fileInfo = ""; // what kind of encrypted.json the server gave us (for error messages)
   let engine = null;
   let hasGeneratedOnce = false;
   let gpuLost = false;
@@ -247,9 +248,11 @@
   }
 
   async function decryptChatLog(passphrase) {
-    const res = await fetch(DATA_FILE);
+    const res = await fetch(DATA_FILE, { cache: "no-store" }); // never a stale cached copy
     if (!res.ok) throw new Error("Could not load encrypted.json");
-    const { salt, iv, ciphertext, iterations = DEFAULT_ITERATIONS, compressed = false } = await res.json();
+    const data = await res.json();
+    const { salt, iv, ciphertext, iterations = DEFAULT_ITERATIONS, compressed = false } = data;
+    fileInfo = data.v ? `new format, ${iterations.toLocaleString()} iterations` : `old format, ${iterations.toLocaleString()} iterations`;
     if (!Number.isInteger(iterations) || iterations < 100000 || iterations > 5000000) {
       throw new Error("Unexpected iteration count in encrypted.json");
     }
@@ -434,24 +437,45 @@
     $("error").textContent = "";
     $("status").textContent = "Decrypting...";
 
+    const fail = (msg) => {
+      $("error").textContent = msg;
+      $("unlock-btn").disabled = false;
+      $("status").textContent = "";
+    };
+
     try {
       chatLog = await decryptChatLog(passphrase);
+    } catch (e) {
+      console.error("Unlock failed:", e);
+      if (e && e.name === "OperationError") {
+        return fail(
+          "Wrong passphrase, or this passphrase doesn't match the encrypted.json on the server." +
+          (fileInfo ? ` (Server file: ${fileInfo}.)` : "")
+        );
+      }
+      return fail(`Could not open the data file: ${e && e.message ? e.message : e}`);
+    }
+
+    try {
       populatePersonaSelect(chatLog);
       buildExchangeIndex(chatLog);
     } catch (e) {
-      $("error").textContent = "Wrong passphrase, or the data didn't decrypt. Try again.";
-      $("unlock-btn").disabled = false;
-      $("status").textContent = "";
-      return;
+      console.error("Setup failed:", e);
+      return fail(`Decrypted OK, but the chat data couldn't be processed: ${e && e.message ? e.message : e}`);
     }
 
     $("status").textContent = "Loading the model into your browser (first time is slower)...";
 
-    engine = await CreateMLCEngine(MODEL_ID, {
-      initProgressCallback: (p) => {
-        $("status").textContent = p.text || "Loading model...";
-      },
-    });
+    try {
+      engine = await CreateMLCEngine(MODEL_ID, {
+        initProgressCallback: (p) => {
+          $("status").textContent = p.text || "Loading model...";
+        },
+      });
+    } catch (e) {
+      console.error("Model load failed:", e);
+      return fail(`Unlocked, but the model couldn't load: ${e && e.message ? e.message : e}. This needs a browser with WebGPU (recent Chrome or Edge).`);
+    }
 
     $("status").textContent = "";
     $("lock").style.display = "none";
